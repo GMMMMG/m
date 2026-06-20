@@ -369,6 +369,13 @@ int main(void)
 		// HC-SR501
 		sr501_status = HAL_GPIO_ReadPin(SR501_OUT_GPIO_Port, SR501_OUT_Pin);
 		sr501_detected = (sr501_status == GPIO_PIN_SET) ? 1 : 0;
+
+		// 声音检测模块 - PC6低电平触发，检测到时PC5输出高电平
+		if(HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_6) == GPIO_PIN_RESET) {
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);   // PC5高电平
+		} else {
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET); // PC5低电平
+		}
 		
 		//CH340
 		char uart_buf[64];
