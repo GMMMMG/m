@@ -287,7 +287,7 @@ int main(void)
 	
 	/* DS1302*/
 	DS1302_Init();
-	{ DS1302_TIME t = {26, 6, 21, 7, 6, 13, 20}; DS1302_SetTime(&t); }
+	//{ DS1302_TIME t = {26, 6, 21, 7, 6, 13, 20}; DS1302_SetTime(&t); }
 	
 	
 	// DS1302
@@ -413,16 +413,16 @@ int main(void)
 		else
 			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
 		
-		// PC12按钮检测，控制PC10灯和PC11蜂鸣器（按一下切换状态）
+		// PA1按钮检测，控制PC10灯和PC11蜂鸣器（按一下切换状态）
 		static uint8_t alarm_state = 0;  // 0:关闭  1:开启
 		static uint8_t last_button_state = GPIO_PIN_RESET;  // 上一次的按键状态
-		uint8_t button_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_12);
-		
+		uint8_t button_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1);
+
 		// 检测按键上升沿（从松开到按下）
 		if(button_state == GPIO_PIN_SET && last_button_state == GPIO_PIN_RESET)
 		{
 			HAL_Delay(20);  // 简单消抖
-			button_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_12);
+			button_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1);
 			if(button_state == GPIO_PIN_SET)
 			{
 				alarm_state = !alarm_state;  // 切换状态
