@@ -8,7 +8,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "adc.h"     //MQ135
+#include "adc.h"
 #include "i2c.h"
 #include "rtc.h"
 #include "usart.h"
@@ -26,10 +26,7 @@
 #include "bsp_i2c.h"
 #include "DS1302.h"
 #include "string.h"
-#include "esp8266_onenet.h"
-#include "common.h"
-#include "mqttkit.h"
-//#include "NanoEdgeAI.h"
+#include "NanoEdgeAI.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,16 +42,21 @@
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
 
+uint8_t white_led_state = 0;       // PC1白灯状态（0灭1亮），按钮和语音共同控制
+uint8_t uart2_rx_data = 0;         // USART2接收缓冲区（ASR PRO语音指令）
+
+BH1750_t bh1750;
+
 RTC_TimeTypeDef sTime;
 RTC_DateTypeDef sDate;
-// MAX30102 ??
+
+// MAX30102
 uint16_t HeartRate = 0;
 float SpO2 = 0;
 float max30102_data[2] = {0};
@@ -62,13 +64,12 @@ float fir_output[2] = {0};
 uint8_t data_ready = 0;
 char lcd_buf[32];
 
-//MQ135
+//MQ135           
 uint32_t mq135_adc_value = 0;      // ADC??? (0-4095)
 float mq135_voltage = 0.0f;        // ???????
-uint8_t mq135_alarm = 0;           // DO?????? (0=??,1=??)
+uint8_t mq135_alarm = 0;
 
 // BH1750
-BH1750_t bh1750;
 float bh1750_lux = 0;
 uint8_t bh1750_ok = 0;
 
@@ -80,25 +81,34 @@ uint8_t sr501_detected = 0;
 DS1302_TIME ds1302_time;
 
 // NanoEdge AI
-//enum neai_state neai_state;
-//bool use_pretrained = false;
-//uint8_t similarity;
-//float input_signal[NEAI_INPUT_SIGNAL_LENGTH * NEAI_INPUT_AXIS_NUMBER];
-
-int16_t temperature,humidity;
-static uint32_t last_onenet_upload = 0U;
-static ESP8266_OneNET_Status_t last_onenet_status = ESP8266_ONENET_STATUS_OFFLINE;
-static ESP8266_OneNET_Error_t last_onenet_error = ESP8266_ONENET_ERROR_NONE;
-uint8_t Uart2_RxData = 0;
-
+enum neai_state neai_state;
+bool use_pretrained = true;  // true = 使用预训练模型，无需学习阶段
+uint8_t similarity;
+float input_signal[NEAI_INPUT_SIGNAL_LENGTH * NEAI_INPUT_AXIS_NUMBER];
 /* USER CODE END PV */
+
+// 界面状态
+typedef enum {
+    SCREEN_MAIN = 0,
+    SCREEN_ENV = 1,
+    SCREEN_HUMAN = 2
+} ScreenType;
+static ScreenType current_screen = SCREEN_MAIN;
+static ScreenType last_screen = SCREEN_MAIN;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void RTC_SetTime(uint8_t hh, uint8_t mm, uint8_t ss);
 void RTC_GetNowTime(void);
-
+void fill_buffer(float *input_signal);
+void Key_Scan(void);
+void Init_Main_Screen(void);
+void Update_Main_Screen(void);
+void Init_Env_Screen(void);
+void Update_Env_Screen(void);
+void Init_Human_Screen(void);
+void Update_Human_Screen(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -106,10 +116,121 @@ void RTC_GetNowTime(void);
 static uint16_t last_hr = 0;
 static float last_spo2 = 0;
 
-int fputc(int ch, FILE *f)
+float temp, humi;
+
+void fill_buffer(float *input_signal)
 {
-	HAL_UART_Transmit(&huart1, (uint8_t*)&ch, 1, 100);
-	return ch;
+    // 使用您的传感器数据填充缓冲区
+    // 根据 NanoEdgeAI.h 配置：3轴 x 1样本 = 3个 float 值
+    input_signal[0] = temp;           // 轴1：温度
+    input_signal[1] = humi;           // 轴2：湿度
+    input_signal[2] = bh1750_lux;     // 轴3：光照强度
+}
+
+// 按键扫描函数（带消抖）
+void Key_Scan(void) {
+    static uint8_t k1_state = 1, k2_state = 1, k3_state = 1;
+    static uint32_t k1_tick = 0, k2_tick = 0, k3_tick = 0;
+
+    // K1 - PA12 - 主界面
+    if(HAL_GPIO_ReadPin(K1_GPIO_Port, K1_Pin) == GPIO_PIN_RESET) {
+        if(k1_state && (HAL_GetTick() - k1_tick > 50)) {
+            k1_state = 0;
+            k1_tick = HAL_GetTick();
+            current_screen = SCREEN_MAIN;
+        }
+    } else {
+        k1_state = 1;
+    }
+
+    // K2 - PA11 - 环境界面
+    if(HAL_GPIO_ReadPin(K2_GPIO_Port, K2_Pin) == GPIO_PIN_RESET) {
+        if(k2_state && (HAL_GetTick() - k2_tick > 50)) {
+            k2_state = 0;
+            k2_tick = HAL_GetTick();
+            current_screen = SCREEN_ENV;
+        }
+    } else {
+        k2_state = 1;
+    }
+
+    // K3 - PB12 - 人体检测界面
+    if(HAL_GPIO_ReadPin(K3_GPIO_Port, K3_Pin) == GPIO_PIN_RESET) {
+        if(k3_state && (HAL_GetTick() - k3_tick > 50)) {
+            k3_state = 0;
+            k3_tick = HAL_GetTick();
+            current_screen = SCREEN_HUMAN;
+        }
+    } else {
+        k3_state = 1;
+    }
+}
+
+// 主界面
+void Init_Main_Screen(void) {
+    Lcd_Clear(BLACK);
+    LCD_Show_String(16, 20, "SMART HEALTH");
+    LCD_Show_String(0, 120, "K1-MAIN");
+    LCD_Show_String(56, 120, "K2-ENV");
+    LCD_Show_String(104, 120, "K3-HUMAN");
+}
+
+void Update_Main_Screen(void) {
+    sprintf(lcd_buf, "%02d:%02d:%02d", ds1302_time.hour, ds1302_time.min, ds1302_time.sec);
+    LCD_Show_String(24, 50, lcd_buf);
+    sprintf(lcd_buf, "20%02d-%02d-%02d", ds1302_time.year, ds1302_time.mon, ds1302_time.day);
+    LCD_Show_String(20, 70, lcd_buf);
+}
+
+// 环境界面
+void Init_Env_Screen(void) {
+    Lcd_Clear(BLACK);
+    LCD_Show_String(0, 0, "ENVIRONMENT");
+    LCD_Show_String(0, 140, "BACK: K1");
+}
+
+void Update_Env_Screen(void) {
+    sprintf(lcd_buf, "TEMP: %.1f C", temp);
+    LCD_Show_String(0, 20, lcd_buf);
+    sprintf(lcd_buf, "HUMI: %.1f %%", humi);
+    LCD_Show_String(0, 40, lcd_buf);
+    if(bh1750_ok)
+        sprintf(lcd_buf, "LUX: %.1f lx", bh1750_lux);
+    else
+        sprintf(lcd_buf, "LUX: --- lx");
+    LCD_Show_String(0, 60, lcd_buf);
+    sprintf(lcd_buf, "MQ135: %.2fV", mq135_voltage);
+    LCD_Show_String(0, 80, lcd_buf);
+    if(mq135_alarm == 0)
+        LCD_Show_String(0, 100, "AIR: POOR");
+    else
+        LCD_Show_String(0, 100, "AIR: GOOD");
+}
+
+// 人体检测界面
+void Init_Human_Screen(void) {
+    Lcd_Clear(BLACK);
+    LCD_Show_String(0, 0, "HUMAN DETECT");
+    LCD_Show_String(0, 140, "BACK: K1");
+}
+
+void Update_Human_Screen(void) {
+    if(HeartRate >= 40 && HeartRate <= 180)
+        sprintf(lcd_buf, "HR: %3d bpm", HeartRate);
+    else
+        sprintf(lcd_buf, "HR: --- bpm");
+    LCD_Show_String(0, 25, lcd_buf);
+    if(SpO2 >= 70 && SpO2 <= 100)
+        sprintf(lcd_buf, "SPO2: %3.0f %%", SpO2);
+    else
+        sprintf(lcd_buf, "SPO2: --- %%");
+    LCD_Show_String(0, 50, lcd_buf);
+    if(sr501_detected)
+        LCD_Show_String(0, 75, "BODY: DETECTED");
+    else
+        LCD_Show_String(0, 75, "BODY: NO");
+    sprintf(lcd_buf, "SIM: %3d %%", similarity);
+    LCD_Show_String(0, 100, lcd_buf);
 }
 /* USER CODE END 0 */
 
@@ -121,7 +242,7 @@ int main(void)
 {
 	
 	/* USER CODE BEGIN 1 */
-
+	
 	/* USER CODE END 1 */
 	
 	/* MCU Configuration--------------------------------------------------------*/
@@ -142,23 +263,22 @@ int main(void)
 	
 	/* Initialize all configured peripherals */
 	MX_GPIO_Init();
-	MX_I2C1_Init();            // MAX30102
-	//MX_USART2_UART_Init();
-	MX_USART3_UART_Init();     // ESP-01S
-	MX_I2C2_Init();            // AHT20 + BMP280
+	MX_I2C2_Init();
+	MX_I2C1_Init();
 	MX_I2C3_Init();
 	MX_USART1_UART_Init();
-	MX_ADC1_Init();            // MQ135    ???ADC1 (PA0)
-	/* USER CODE BEGIN 2 */
-	HAL_Delay(100);
-	HAL_ADC_Start(&hadc1);     // ??ADC??
+	MX_USART2_UART_Init();
+	MX_ADC1_Init();
 	
-	// LCD ???
+	HAL_Delay(100);
+	
+	HAL_ADC_Start(&hadc1);
 	Lcd_Init();
 	Lcd_Clear(BLACK);
-	//ESP8266_OneNET_Init(&huart3);
 	
-	// AHT20 ???
+	/* USER CODE BEGIN 2 */
+	
+	/* AHT20 */
 	AHT20_Init();
 	if (HAL_I2C_IsDeviceReady(&hi2c2, AHT20_ADDRESS, 3, 100) == HAL_OK)
 		LCD_Show_String(0, 0, "AHT20 OK");
@@ -167,7 +287,9 @@ int main(void)
 	
 	/* DS1302*/
 	DS1302_Init();
-	//{ DS1302_TIME t = {24, 6, 15, 6, 23, 18, 0}; DS1302_SetTime(&t); }
+	{ DS1302_TIME t = {26, 6, 21, 7, 6, 13, 20}; DS1302_SetTime(&t); }
+	
+	
 	// DS1302
 	uint8_t test_sec = 0;
 	DS1302_TIME test_time;
@@ -203,20 +325,19 @@ int main(void)
 	
 	
 	// NanoEdge AI
-	//neai_state = neai_anomalydetection_init(use_pretrained);
-	//if (neai_state == NEAI_OK) {
-	//	LCD_Show_String(0, 64, "AI OK");
-	//} else {
-	//	LCD_Show_String(0, 64, "AI ERR");
-	//}
+	neai_state = neai_anomalydetection_init(use_pretrained);
+	if (neai_state == NEAI_OK) {
+		LCD_Show_String(0, 64, "AI OK");
+	} else {
+		LCD_Show_String(0, 64, "AI ERR");
+	}
 	
 	HAL_Delay(1000);
 	Lcd_Clear(BLACK);
 	
-	//MAX30102 FIFO
+	//  MAX30102 
 	cache_counter = 0;
 	
-	float temp, humi;
 	
 	/* USER CODE END 2 */
 	
@@ -224,25 +345,19 @@ int main(void)
 	/* USER CODE BEGIN WHILE */
 	while (1)
 	{
+		/* USER CODE END WHILE */
 		AHT20_Read(&temp, &humi);
 		DS1302_ReadTime(&ds1302_time);
 		
-		//OneNET
-		temperature = temp;
-		humidity = humi;
-		
-		//MQ135
-		//PA0 ADC
+		// MQ135
 		if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
 		{
 			mq135_adc_value = HAL_ADC_GetValue(&hadc1);
 			mq135_voltage = mq135_adc_value * 3.3f / 4096.0f;
 		}
-		//PB0
-		mq135_alarm = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0);
+		mq135_alarm = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0); // PB0
 		
-		
-		// MAX30102
+		// MAX30102 
 		data_ready = MAX30102_Get_DATA(&HeartRate, &SpO2, max30102_data, fir_output);
 		
 		// BH1750 
@@ -255,144 +370,109 @@ int main(void)
 		sr501_status = HAL_GPIO_ReadPin(SR501_OUT_GPIO_Port, SR501_OUT_Pin);
 		sr501_detected = (sr501_status == GPIO_PIN_SET) ? 1 : 0;
 		
-		// CH340
-		char uart_buf[96];
-		sprintf(uart_buf, "TEMP:%.1f,HUMI:%.1f,MQ135:%.2fV,ALARM:%d,S:%d,E:%d\r\n",
-            temp, humi, mq135_voltage, mq135_alarm == 0 ? 1 : 0,
-            ESP8266_OneNET_GetStatus(), ESP8266_OneNET_GetLastError());
+		//CH340
+		char uart_buf[64];
+		sprintf(uart_buf, "%.1f,%.1f,%.1f\r\n", temp, humi, bh1750_lux);
 		HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 100);
 
-        if ((ESP8266_OneNET_GetStatus() != last_onenet_status) ||
-            (ESP8266_OneNET_GetLastError() != last_onenet_error))
-        {
-            last_onenet_status = ESP8266_OneNET_GetStatus();
-            last_onenet_error = ESP8266_OneNET_GetLastError();
-            snprintf(uart_buf, sizeof(uart_buf), "ONENET DBG S:%d,E:%d,R:%s\r\n",
-                     last_onenet_status, last_onenet_error,
-                     ESP8266_OneNET_GetLastResponse());
-            HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-        }
-		
-		//DS1302
-		sprintf(lcd_buf, "TIME:%02d:%02d:%02d", ds1302_time.hour, ds1302_time.min, ds1302_time.sec);
-		LCD_Show_String(0, 0, lcd_buf);
-		
-		//AHT20
-		sprintf(lcd_buf, "TEMP:%.1f C", temp);
-		LCD_Show_String(0, 16, lcd_buf);
-		sprintf(lcd_buf, "HUMI:%.1f %%", humi);
-		LCD_Show_String(0, 32, lcd_buf);
-		
-		// BH1750 
-		if(bh1750_ok)
-			sprintf(lcd_buf, "LUX:%.1f lx", bh1750_lux);
-		else
-			sprintf(lcd_buf, "LUX: --- lx");
-		LCD_Show_String(0, 48, lcd_buf);
-		
-		//MAX30102
-		if (HeartRate < 1u)
-		{
-			last_hr = 0u;
-			sprintf(lcd_buf, "HR: ---bpm");
-		}
-		else if (HeartRate >= MAX30102_HR_VALID_LO && HeartRate <= MAX30102_HR_VALID_HI)
-		{
-			last_hr = HeartRate;
-			sprintf(lcd_buf, "HR:%3d bpm", HeartRate);
-		}
-		else if (last_hr >= MAX30102_HR_VALID_LO && last_hr <= MAX30102_HR_VALID_HI)
-			sprintf(lcd_buf, "HR:%3d~bpm", last_hr);
-		else
-			sprintf(lcd_buf, "HR: ---bpm");
-		LCD_Show_String(0, 64, lcd_buf);
-		
-		if (SpO2 < 1.0f)
-		{
-			last_spo2 = 0.0f;
-			sprintf(lcd_buf, "SPO2: ---%%");
-		}
-		else if (SpO2 >= 65.0f && SpO2 <= 100.0f)
-		{
-			last_spo2 = SpO2;
-			sprintf(lcd_buf, "SPO2:%3.0f %%", SpO2);
-		}
-		else if (last_spo2 >= 65.0f && last_spo2 <= 100.0f)
-			sprintf(lcd_buf, "SPO2:%3.0f~%%", last_spo2);
-		else
-			sprintf(lcd_buf, "SPO2: ---%%");
-		LCD_Show_String(0, 80, lcd_buf);
-		
-		//MQ135
-		sprintf(lcd_buf, "MQ135:%.2fV", mq135_voltage);
-		LCD_Show_String(0, 96, lcd_buf);
-		if (mq135_alarm == 0)
-			LCD_Show_String(0, 112, "AIR:POOR");
-		else
-			LCD_Show_String(0, 112, "AIR:GOOD");
-		
-		// HC-SR501
-		if(sr501_detected)
-			sprintf(lcd_buf, "BODY: YES");
-		else
-			sprintf(lcd_buf, "BODY: NO ");
-		LCD_Show_String(0, 128, lcd_buf);
-		
-		//OneNet
-		//LCD_Show_String(0, 144, "S:");
-		//LCD_Show_Num(16, 144, ESP8266_OneNET_GetStatus(), 1);
-		//LCD_Show_String(32, 144, "E:");
-		//LCD_Show_Num(48, 144, ESP8266_OneNET_GetLastError(), 2);
-		
-		
-		ESP8266_OneNET_Task();
+		// 按键扫描
+		Key_Scan();
 
-        if ((HAL_GetTick() - last_onenet_upload) >= ONENET_UPLOAD_INTERVAL_MS)
-        {
-            last_onenet_upload = HAL_GetTick();
-            (void)ESP8266_OneNET_PostData((int32_t)HeartRate, (double)humidity, bh1750_lux, SpO2, (double)temperature);
-        }
+		// 界面切换检测
+		if(current_screen != last_screen) {
+			last_screen = current_screen;
+			switch(current_screen) {
+				case SCREEN_MAIN:
+					Init_Main_Screen();
+					break;
+				case SCREEN_ENV:
+					Init_Env_Screen();
+					break;
+				case SCREEN_HUMAN:
+					Init_Human_Screen();
+					break;
+			}
+		}
+
+		// 根据当前界面更新显示
+		switch(current_screen) {
+			case SCREEN_MAIN:
+				Update_Main_Screen();
+				break;
+			case SCREEN_ENV:
+				Update_Env_Screen();
+				break;
+			case SCREEN_HUMAN:
+				Update_Human_Screen();
+				break;
+		}
 		
-		// PC2 ????
+		// PC2 人体检测
 		if(sr501_detected)
 			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
 		else
 			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
 		
-		// PC12????,??PC10??PC11???(???????)
-		static uint8_t alarm_state = 0;  // 0:??  1:??
-		static uint8_t last_button_state = GPIO_PIN_RESET;  // ????????
+		// PC12按钮检测，控制PC10灯和PC11蜂鸣器（按一下切换状态）
+		static uint8_t alarm_state = 0;  // 0:关闭  1:开启
+		static uint8_t last_button_state = GPIO_PIN_RESET;  // 上一次的按键状态
 		uint8_t button_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_12);
 		
-		// ???????(??????)
+		// 检测按键上升沿（从松开到按下）
 		if(button_state == GPIO_PIN_SET && last_button_state == GPIO_PIN_RESET)
 		{
-			HAL_Delay(20);  // ????
+			HAL_Delay(20);  // 简单消抖
 			button_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_12);
 			if(button_state == GPIO_PIN_SET)
 			{
-				alarm_state = !alarm_state;  // ????
+				alarm_state = !alarm_state;  // 切换状态
 			}
 		}
 		last_button_state = button_state;
 		
-		// ???????????
+		// 根据状态控制灯和蜂鸣器
 		if(alarm_state)
 		{
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);  // PC10?
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_SET);  // PC11????
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);  // PC10亮
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_SET);  // PC11蜂鸣器响
 		}
 		else
 		{
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);  // PC10?
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_RESET);  // PC11????
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);  // PC10灭
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_RESET);  // PC11蜂鸣器停
 		}
 		
+		// PC0按钮检测，控制PC1白灯（按一下切换状态）
+		static uint8_t last_pc0_state = GPIO_PIN_RESET;  // 上一次的按键状态
+		uint8_t pc0_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0);
+		
+		// 检测按键上升沿（从松开到按下）
+		if(pc0_state == GPIO_PIN_SET && last_pc0_state == GPIO_PIN_RESET)
+		{
+			HAL_Delay(20);  // 简单消抖
+			pc0_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0);
+			if(pc0_state == GPIO_PIN_SET)
+			{
+				white_led_state = !white_led_state;  // 切换状态
+			}
+		}
+		last_pc0_state = pc0_state;
+		
+		// 根据状态控制PC1白灯
+		if(white_led_state)
+		{
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);  // PC1亮
+		}
+		else
+		{
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET);  // PC1灭
+		}
+		
+		// NanoEdge AI 直接检测（使用预训练模型）
+		fill_buffer(input_signal);
+		neai_anomalydetection_detect(input_signal, &similarity);
+
 		HAL_Delay(100);
-		/* USER CODE END WHILE */
-		
-		
-				
 		/* USER CODE BEGIN 3 */
 	}
 	/* USER CODE END 3 */
